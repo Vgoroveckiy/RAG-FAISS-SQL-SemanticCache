@@ -1,3 +1,30 @@
+"""
+main.py — Retrieval Augmented Generation (RAG) система для поиска и генерации ответов по ювелирным изделиям.
+
+Функционал:
+- Индексация документов (PDF, DOCX, TXT, JSON-каталоги) с помощью FAISS и LangChain.
+- Хранение метаданных и текстов в SQLite.
+- Семантический кэш вопросов/ответов.
+- Интерактивный чат и тестовые вопросы.
+
+Запуск:
+    python main.py
+
+Меню:
+    1. Очистить данные (индексы FAISS и базу данных)
+    2. Проиндексировать документы (из папки 'data')
+    3. Запустить интерактивный чат
+    4. Запустить тестовые вопросы
+    0. Выйти
+
+Требования:
+    - Python 3.8+
+    - Все зависимости из requirements.txt
+
+Автор: [Ваше имя или команда]
+Дата: 2025
+"""
+
 import argparse
 import hashlib
 import json
@@ -107,7 +134,8 @@ class DocumentStorage:
             file_hash TEXT,
             last_modified REAL,
             content TEXT,
-            metadata TEXT
+            metadata TEXT,
+            faiss_chunk_ids TEXT -- Новое поле для хранения ID чанков FAISS
         )
         """
         )
@@ -120,6 +148,7 @@ class DocumentStorage:
         last_modified: float,
         content: str,
         metadata: dict,
+        faiss_chunk_ids: Optional[List[str]] = None,  # Новый аргумент
     ):
         """
         Добавляет или обновляет информацию о документе в базе данных.
@@ -130,14 +159,24 @@ class DocumentStorage:
             last_modified (float): Время последнего изменения файла (Unix timestamp).
             content (str): Извлеченное текстовое содержимое **всего** документа.
             metadata (dict): Дополнительные метаданные документа (например, источник).
+            faiss_chunk_ids (Optional[List[str]]): Список ID чанков FAISS, относящихся к этому документу.
         """
+        if faiss_chunk_ids is None:
+            faiss_chunk_ids = []
         cursor = self.conn.cursor()
         cursor.execute(
             """
-        INSERT OR REPLACE INTO documents (file_path, file_hash, last_modified, content, metadata)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT OR REPLACE INTO documents (file_path, file_hash, last_modified, content, metadata, faiss_chunk_ids)
+        VALUES (?, ?, ?, ?, ?, ?)
         """,
-            (file_path, file_hash, last_modified, content, json.dumps(metadata)),
+            (
+                file_path,
+                file_hash,
+                last_modified,
+                content,
+                json.dumps(metadata),
+                json.dumps(faiss_chunk_ids),
+            ),
         )
         self.conn.commit()
 
@@ -154,7 +193,7 @@ class DocumentStorage:
         """
         cursor = self.conn.cursor()
         cursor.execute(
-            "SELECT file_hash, last_modified, content, metadata FROM documents WHERE file_path = ?",
+            "SELECT file_hash, last_modified, content, metadata, faiss_chunk_ids FROM documents WHERE file_path = ?",
             (file_path,),
         )
         row = cursor.fetchone()
@@ -164,6 +203,9 @@ class DocumentStorage:
                 "last_modified": row[1],
                 "content": row[2],
                 "metadata": json.loads(row[3]) if row[3] else {},
+                "faiss_chunk_ids": (
+                    json.loads(row[4]) if row[4] else []
+                ),  # Загружаем как список
             }
         return None
 
@@ -174,9 +216,7 @@ class DocumentStorage:
 
 class VectorDatabase:
     """
-    Класс для управления векторными базами данных FAISS.
-
-    Используется для основного индекса документов и для кэша вопросов/ответов.
+    Управляет FAISS-векторными индексами для документов и кэша вопросов/ответов.
     """
 
     def __init__(
@@ -198,16 +238,19 @@ class VectorDatabase:
         self.cache_db: Optional[FAISS] = None
         """FAISS индекс для кэшированных вопросов и ответов."""
 
-    def load_or_create(self, documents: List[Document], force_recreate: bool = False):
+    def load_or_create(
+        self, documents: Optional[List[Document]] = None, force_recreate: bool = False
+    ):
         """
-        Загружает или создает основной индекс FAISS из списка сегментов документов.
+        Загружает или создает основной индекс FAISS.
+        Если индекс существует, он загружается. Если нет, или force_recreate=True,
+        он создается с нуля.
 
         Args:
-            documents (List[Document]): Список сегментов документов LangChain для индексации.
+            documents (Optional[List[Document]]): Список сегментов документов LangChain для индексации.
+                                                  Используется только при создании нового индекса.
             force_recreate (bool): Если True, индекс будет пересоздан, даже если он существует.
                                    По умолчанию False.
-        Raises:
-            ValueError: Если documents пуст при создании нового индекса.
         """
         if not force_recreate and os.path.exists(self.index_path):
             print(f"Загрузка существующего FAISS индекса из {self.index_path}...")
@@ -215,22 +258,13 @@ class VectorDatabase:
                 self.index_path, self.embeddings, allow_dangerous_deserialization=True
             )
         else:
-            if documents:
-                print(f"Создание нового FAISS индекса в {self.index_path}...")
-                self.db = FAISS.from_documents(documents, self.embeddings)
-                self.db.save_local(self.index_path)
-            else:
-                # Если документов нет, создаем пустой индекс, чтобы избежать ошибок при инициализации ретривера
-                print(
-                    "Нет документов для создания FAISS индекса. Создается пустой индекс."
-                )
-                # Создаем временный "пустой" документ, чтобы инициализировать FAISS,
-                # затем удаляем его, чтобы индекс был фактически пустым.
-                dummy_doc = Document(page_content="initialization_dummy", metadata={})
-                self.db = FAISS.from_documents([dummy_doc], self.embeddings)
-                # Удаляем "пустой" документ
-                self.db.delete([self.db.index_to_docstore_id[0]])
-                self.db.save_local(self.index_path)
+            print(f"Создание нового FAISS индекса в {self.index_path}...")
+            # Создаем пустой индекс, чтобы его можно было использовать для добавления/удаления
+            dummy_doc = Document(page_content="initialization_dummy", metadata={})
+            self.db = FAISS.from_documents([dummy_doc], self.embeddings)
+            # Удаляем "пустой" документ, чтобы индекс был фактически пустым
+            self.db.delete([self.db.index_to_docstore_id[0]])
+            self.db.save_local(self.index_path)  # Сохраняем пустой индекс
 
     def load_or_create_cache(self, force_recreate: bool = False):
         """
@@ -252,20 +286,29 @@ class VectorDatabase:
             self.cache_db.delete([self.cache_db.index_to_docstore_id[0]])
             self.cache_db.save_local(self.cache_path)
 
-    def add_to_cache(self, question: str, answer: str):
+    def add_to_cache(
+        self, question: str, answer: str, sources: Optional[List[str]] = None
+    ):
         """
         Добавляет вопрос и соответствующий ответ в кэш FAISS.
 
         Args:
             question (str): Запрос пользователя.
             answer (str): Сгенерированный ответ LLM.
+            sources (Optional[List[str]]): Список источников (путей к файлам), на основе которых был сгенерирован ответ.
         """
         if not self.cache_db:
             self.load_or_create_cache()
 
         doc = Document(
             page_content=question,
-            metadata={"answer": answer, "timestamp": datetime.now().isoformat()},
+            metadata={
+                "answer": answer,
+                "timestamp": datetime.now().isoformat(),
+                "sources": (
+                    sources if sources is not None else []
+                ),  # Добавляем источники
+            },
         )
         self.cache_db.add_documents([doc])
         self.cache_db.save_local(self.cache_path)
@@ -273,7 +316,7 @@ class VectorDatabase:
     def get_cached_answer(
         self,
         question: str,
-        similarity_threshold: float = 0.1,  # Для L2 расстояния, чем меньше, тем лучше
+        similarity_threshold: float = 0.1,
     ) -> Optional[str]:
         """
         Пытается найти кэшированный ответ на вопрос, если существует достаточно похожий запрос.
@@ -310,6 +353,71 @@ class VectorDatabase:
             )
         return None
 
+    def delete_documents(self, faiss_chunk_ids: List[str]):
+        """
+        Удаляет документы из FAISS индекса по их внутренним ID.
+
+        Args:
+            faiss_chunk_ids (List[str]): Список внутренних ID чанков FAISS для удаления.
+        """
+        if not self.db:
+            print("FAISS индекс не инициализирован. Невозможно удалить документы.")
+            return
+
+        if faiss_chunk_ids:
+            try:
+                self.db.delete(faiss_chunk_ids)
+                self.db.save_local(self.index_path)
+                print(f"Удалено {len(faiss_chunk_ids)} старых чанков из FAISS.")
+            except Exception as e:
+                print(f"Ошибка при удалении чанков из FAISS: {e}")
+        else:
+            print("Нет FAISS chunk IDs для удаления.")
+
+    def delete_cached_entries_by_source(self, source_file_name: str):
+        """
+        Удаляет все записи из кэша, которые ссылаются на данный исходный файл.
+        Использует базовое имя файла (например, "catalog.json" или "document.pdf").
+
+        Args:
+            source_file_name (str): Базовое имя файла-источника для инвалидации кэша.
+        """
+        if not self.cache_db:
+            print(
+                "Кэш FAISS не инициализирован. Невозможно удалить кэшированные записи."
+            )
+            return
+
+        if self.cache_db.index.ntotal == 0:
+            print("Кэш пуст, нечего удалять.")
+            return
+
+        ids_to_delete = []
+        for doc_id in list(
+            self.cache_db.docstore._dict.keys()
+        ):  # Iterate over docstore IDs
+            doc = self.cache_db.docstore.search(doc_id)
+            if doc and doc.metadata.get("sources"):
+                # Проверяем, есть ли source_file_name в списке источников кэшированного ответа
+                # Источники в метаданных - это полные пути (или file_path#index),
+                # но мы их храним в add_to_cache как базовые имена, чтобы совпасть здесь.
+                if source_file_name in doc.metadata["sources"]:
+                    ids_to_delete.append(doc_id)
+
+        if ids_to_delete:
+            try:
+                self.cache_db.delete(ids_to_delete)
+                self.cache_db.save_local(self.cache_path)
+                print(
+                    f"Удалено {len(ids_to_delete)} кэшированных записей, связанных с источником '{source_file_name}'."
+                )
+            except Exception as e:
+                print(f"Ошибка при удалении кэшированных записей: {e}")
+        else:
+            print(
+                f"Не найдено кэшированных записей, связанных с источником '{source_file_name}'."
+            )
+
 
 def get_file_hash(file_path: str) -> str:
     """
@@ -330,16 +438,87 @@ def get_file_hash(file_path: str) -> str:
     return hasher.hexdigest()
 
 
+def update_document_in_faiss(
+    doc_storage: DocumentStorage,
+    vector_db: VectorDatabase,
+    file_path: str,
+    full_text_content: str,
+    metadata: dict,
+    current_file_hash: str,
+    current_last_modified: float,
+    stored_doc_data: Optional[Dict[str, Any]],
+) -> List[Document]:
+    """
+    Обновляет документ в FAISS: удаляет старые чанки и добавляет новые.
+    Сохраняет новые FAISS IDs в DocumentStorage.
+    Возвращает список новых чанков.
+
+    Args:
+        doc_storage (DocumentStorage): Объект хранилища документов.
+        vector_db (VectorDatabase): Объект векторной базы данных.
+        file_path (str): Уникальный путь к документу (например, "data/catalog.json#0").
+        full_text_content (str): Полный текст документа.
+        metadata (dict): Метаданные документа.
+        current_file_hash (str): Хэш текущего содержимого файла.
+        current_last_modified (float): Время последнего изменения файла.
+        stored_doc_data (Optional[Dict[str, Any]]): Данные о документе из БД, если есть.
+
+    Returns:
+        List[Document]: Список новых чанков для индексации.
+    """
+    # Извлекаем базовое имя файла для инвалидации кэша
+    base_file_name_for_cache_invalidation = os.path.basename(file_path.split("#")[0])
+
+    if stored_doc_data and stored_doc_data.get("faiss_chunk_ids"):
+        # Удаляем старые чанки из FAISS-индекса документов
+        vector_db.delete_documents(stored_doc_data["faiss_chunk_ids"])
+        print(f"Удалены старые FAISS чанки для {os.path.basename(file_path)}.")
+
+    # **Инвалидация семантического кэша, связанного с этим источником**
+    print(
+        f"Инвалидация кэша вопросов/ответов, связанных с '{base_file_name_for_cache_invalidation}'..."
+    )
+    vector_db.delete_cached_entries_by_source(base_file_name_for_cache_invalidation)
+
+    # Создаем новые чанки
+    new_chunks = text_splitter.create_documents(
+        [full_text_content], metadatas=[metadata]
+    )
+
+    new_faiss_chunk_ids = []
+    if new_chunks:
+        if not vector_db.db:
+            vector_db.load_or_create()  # Убедимся, что индекс загружен или создан пустым
+        new_faiss_chunk_ids = vector_db.db.add_documents(new_chunks)
+        vector_db.db.save_local(vector_db.index_path)
+        print(f"Добавлено {len(new_faiss_chunk_ids)} новых чанков в FAISS.")
+    else:
+        print(f"Нет новых чанков для добавления для {os.path.basename(file_path)}.")
+
+    # Обновляем информацию о документе в SQL DB с новыми FAISS IDs
+    doc_storage.add_document(
+        file_path=file_path,
+        file_hash=current_file_hash,
+        last_modified=current_last_modified,
+        content=full_text_content,
+        metadata=metadata,
+        faiss_chunk_ids=new_faiss_chunk_ids,
+    )
+    return new_chunks
+
+
 def process_catalog_json(
-    file_path: str, doc_storage: DocumentStorage
+    file_path: str, doc_storage: DocumentStorage, vector_db: VectorDatabase
 ) -> List[Document]:
     """
     Читает JSON-файл каталога, преобразует каждую запись в LangChain Document
     и сохраняет полный текст записи в SQL DB, а затем сегментирует для FAISS.
+    Реализовано точечное обновление.
 
     Args:
         file_path (str): Путь к JSON-файлу каталога.
         doc_storage (DocumentStorage): Объект хранилища документов для сохранения метаданных.
+        vector_db (VectorDatabase): Объект векторной базы данных для обновления FAISS.
 
     Returns:
         List[Document]: Список объектов LangChain Document (сегментов) для индексации.
@@ -351,7 +530,6 @@ def process_catalog_json(
 
         for i, item in enumerate(catalog_data):
             # Создаем текстовое представление для каждого элемента каталога
-            # чтобы LLM мог его легко понять
             item_text_content = (
                 f"Название: {item.get('name', 'N/A')}\n"
                 f"Описание: {item.get('description', 'N/A')}\n"
@@ -361,7 +539,6 @@ def process_catalog_json(
             )
 
             # Создаем уникальный file_path для каждого элемента каталога
-            # Это важно, так как в SQL DB file_path UNIQUE
             unique_item_path = f"{file_path}#{i}"
 
             # Метаданные для каждого элемента каталога
@@ -369,14 +546,11 @@ def process_catalog_json(
                 "source": os.path.basename(file_path),
                 "item_name": item.get("name", "N/A"),
                 "item_url": item.get("url", "N/A"),
-                "index_in_catalog": i,  # Полезно для отладки
+                "index_in_catalog": i,
             }
 
-            # Проверяем, есть ли уже этот элемент в кэше SQL DB
             file_hash = hashlib.sha256(item_text_content.encode()).hexdigest()
-            last_modified = os.path.getmtime(
-                file_path
-            )  # Используем время изменения файла каталога
+            last_modified = os.path.getmtime(file_path)
 
             stored_item = doc_storage.get_document(unique_item_path)
 
@@ -385,7 +559,7 @@ def process_catalog_json(
                 and stored_item["file_hash"] == file_hash
                 and stored_item["last_modified"] >= last_modified
             ):
-                # Если элемент не изменился, используем кэшированный текст
+                # Если элемент не изменился, используем кэшированный текст и чанки
                 full_text_from_db = stored_item["content"]
                 chunks = text_splitter.create_documents(
                     [full_text_from_db], metadatas=[metadata]
@@ -395,23 +569,21 @@ def process_catalog_json(
                     f"Используется кэшированный элемент каталога: {item.get('name', 'N/A')} из {os.path.basename(file_path)}"
                 )
             else:
-                # Сохраняем полный текст элемента в SQL DB
-                doc_storage.add_document(
-                    file_path=unique_item_path,
-                    file_hash=file_hash,
-                    last_modified=last_modified,
-                    content=item_text_content,
-                    metadata=metadata,
-                )
+                # Элемент новый или изменился, обновляем его в FAISS и SQL DB
                 print(
-                    f"Обработан новый/измененный элемент каталога: {item.get('name', 'N/A')} из {os.path.basename(file_path)}"
+                    f"Обработка нового/измененного элемента каталога: {item.get('name', 'N/A')} из {os.path.basename(file_path)}"
                 )
-
-                # Сегментируем текст элемента для FAISS
-                chunks = text_splitter.create_documents(
-                    [item_text_content], metadatas=[metadata]
+                new_chunks_for_faiss = update_document_in_faiss(
+                    doc_storage,
+                    vector_db,
+                    unique_item_path,
+                    item_text_content,
+                    metadata,
+                    file_hash,
+                    last_modified,
+                    stored_item,
                 )
-                documents_for_faiss.extend(chunks)
+                documents_for_faiss.extend(new_chunks_for_faiss)
 
         return documents_for_faiss
 
@@ -420,16 +592,17 @@ def process_catalog_json(
         return []
 
 
-def parse_files(directory: str, doc_storage: DocumentStorage) -> List[Document]:
+def parse_files(
+    directory: str, doc_storage: DocumentStorage, vector_db: VectorDatabase
+) -> List[Document]:
     """
     Парсит файлы из заданной директории, извлекает полный текст, сохраняет его в SQL DB,
-    и затем сегментирует для индексации в FAISS.
-
-    Проверяет изменения файлов и использует кэшированные полные тексты при их отсутствии.
+    и затем сегментирует для индексации в FAISS. Реализовано точечное обновление.
 
     Args:
         directory (str): Путь к директории с файлами для обработки.
         doc_storage (DocumentStorage): Объект хранилища документов для сохранения метаданных.
+        vector_db (VectorDatabase): Объект векторной базы данных для обновления FAISS.
 
     Returns:
         List[Document]: Список объектов LangChain Document (сегментов), представляющих содержимое файлов для FAISS.
@@ -440,10 +613,9 @@ def parse_files(directory: str, doc_storage: DocumentStorage) -> List[Document]:
         file_path = os.path.join(directory, filename)
 
         if filename.lower().endswith(".json"):
-            # Обработка JSON-файлов каталога
-            json_chunks = process_catalog_json(file_path, doc_storage)
+            json_chunks = process_catalog_json(file_path, doc_storage, vector_db)
             all_chunks.extend(json_chunks)
-            continue  # Переходим к следующему файлу
+            continue
 
         if filename.lower().endswith(
             (".pdf", ".docx", ".txt")
@@ -474,6 +646,7 @@ def parse_files(directory: str, doc_storage: DocumentStorage) -> List[Document]:
                         f"Внимание: Кэшированный текст для {filename} пуст. Повторная обработка."
                     )
             else:
+                # Документ новый или изменился
                 try:
                     elements = partition(filename=file_path)
                     full_text_from_file = "\n\n".join(
@@ -488,20 +661,18 @@ def parse_files(directory: str, doc_storage: DocumentStorage) -> List[Document]:
 
                     file_metadata = {"source": filename, "file_path": file_path}
 
-                    doc_storage.add_document(
-                        file_path=file_path,
-                        file_hash=file_hash,
-                        last_modified=last_modified,
-                        content=full_text_from_file,
-                        metadata=file_metadata,
+                    print(f"Обработка нового/измененного документа: {filename}.")
+                    new_chunks_for_faiss = update_document_in_faiss(
+                        doc_storage,
+                        vector_db,
+                        file_path,
+                        full_text_from_file,
+                        file_metadata,
+                        file_hash,
+                        last_modified,
+                        stored_doc,
                     )
-                    print(f"Обработан новый/измененный документ: {filename}.")
-
-                    chunks = text_splitter.create_documents(
-                        [full_text_from_file], metadatas=[file_metadata]
-                    )
-                    all_chunks.extend(chunks)
-                    print(f"Создано {len(chunks)} сегментов для индексации FAISS.")
+                    all_chunks.extend(new_chunks_for_faiss)
 
                 except Exception as e:
                     print(f"Ошибка при обработке файла {file_path}: {str(e)}")
@@ -539,16 +710,19 @@ class RAGSystem:
         Инициализирует компоненты системы: загружает/обрабатывает документы и настраивает цепочки LangChain.
         """
         print("Инициализация RAG системы...")
-        documents = parse_files(self.config.INPUT_DIR, self.doc_storage)
-
-        if not documents:
-            print(
-                "ВНИМАНИЕ: Не удалось обработать ни одного документа для индексации. RAG система может работать неоптимально."
-            )
-
-        self.vector_db.load_or_create(documents)
+        # Убедимся, что FAISS индекс инициализирован (загружен или создан пустым)
+        self.vector_db.load_or_create()
         self.vector_db.load_or_create_cache()
-        print("Документы загружены и векторные базы инициализированы.")
+
+        # Парсинг файлов с возможностью точечного обновления
+        documents = parse_files(self.config.INPUT_DIR, self.doc_storage, self.vector_db)
+
+        if not documents and self.vector_db.db.index.ntotal == 0:
+            print(
+                "ВНИМАНИЕ: Нет документов для индексации и FAISS индекс пуст. RAG система может работать неоптимально."
+            )
+        else:
+            print("Документы загружены и векторные базы инициализированы.")
 
         self._init_chains()
         print("Цепочки LangChain инициализированы.")
@@ -586,8 +760,6 @@ class RAGSystem:
             print(
                 "ВНИМАНИЕ: Основной FAISS индекс пуст. Невозможно инициализировать RetrievalQA. Будет использоваться простая LLM-цепочка."
             )
-            # Для простой LLMChain, если контекст не используется, можно упростить промпт
-            # или передавать пустой контекст, как сделано в query()
             self.qa_chain = LLMChain(
                 llm=self.llm,
                 prompt=PromptTemplate(
@@ -607,14 +779,16 @@ class RAGSystem:
                 print("Ответ найден в кэше.")
                 return cached_answer
 
-        if self.retriever is None or self.vector_db.db.index.ntotal == 0:
+        if self.retriever is None or (
+            self.vector_db.db and self.vector_db.db.index.ntotal == 0
+        ):
             print("Используется простая LLM-цепочка (нет документов для ретривала).")
-            # Если ретривер не инициализирован или пуст, используем LLMChain напрямую
             result = self.llm.invoke(f"Вопрос: {question}\nОтвет:")
             answer = result.content
             print("Ответ сгенерирован LLM без использования документов.")
             if use_cache:
-                self.vector_db.add_to_cache(question, answer)
+                # В этом случае источников нет, т.к. LLM ответила без ретривала
+                self.vector_db.add_to_cache(question, answer, sources=[])
                 print("Ответ добавлен в кэш.")
             return answer
 
@@ -622,10 +796,23 @@ class RAGSystem:
         result = self.qa_chain.invoke({"input": question})
         answer = result.get("answer", "Не удалось сгенерировать ответ.")
 
+        retrieved_sources = []
         if "context" in result:
             retrieved_docs = result["context"]
             print(f"Найдено {len(retrieved_docs)} релевантных документов.")
             for i, doc in enumerate(retrieved_docs):
+                source = doc.metadata.get("source", "N/A")
+                # Для JSON-файлов мы используем уникальный путь: data/catalog.json#0
+                # Нужно извлечь только базовое имя файла для кэша: catalog.json
+                if "#" in source:  # Это элемент из JSON-каталога
+                    base_source = os.path.basename(source.split("#")[0])
+                else:  # Это обычный файл
+                    base_source = os.path.basename(source)
+
+                # Добавляем только уникальные базовые имена источников
+                if base_source not in retrieved_sources:
+                    retrieved_sources.append(base_source)
+
                 print(
                     f"--- Документ {i+1} (Источник: {doc.metadata.get('source', 'N/A')}, Item: {doc.metadata.get('item_name', 'N/A')}) ---"
                 )
@@ -635,7 +822,8 @@ class RAGSystem:
         print("Ответ сгенерирован LLM с использованием документов.")
 
         if use_cache:
-            self.vector_db.add_to_cache(question, answer)
+            # Передаем список использованных базовых имен источников в кэш
+            self.vector_db.add_to_cache(question, answer, sources=retrieved_sources)
             print("Ответ добавлен в кэш.")
 
         return answer
