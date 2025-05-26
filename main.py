@@ -1,30 +1,3 @@
-"""
-main.py — Retrieval Augmented Generation (RAG) система для поиска и генерации ответов по ювелирным изделиям.
-
-Функционал:
-- Индексация документов (PDF, DOCX, TXT, JSON-каталоги) с помощью FAISS и LangChain.
-- Хранение метаданных и текстов в SQLite.
-- Семантический кэш вопросов/ответов.
-- Интерактивный чат и тестовые вопросы.
-
-Запуск:
-    python main.py
-
-Меню:
-    1. Очистить данные (индексы FAISS и базу данных)
-    2. Проиндексировать документы (из папки 'data')
-    3. Запустить интерактивный чат
-    4. Запустить тестовые вопросы
-    0. Выйти
-
-Требования:
-    - Python 3.8+
-    - Все зависимости из requirements.txt
-
-Автор: [Вячеслав Горовецкий]
-Дата: 2025
-"""
-
 import argparse
 import hashlib
 import json
@@ -209,6 +182,41 @@ class DocumentStorage:
             }
         return None
 
+    def get_all_document_paths_and_chunk_ids(self) -> List[Dict[str, Any]]:
+        """
+        Извлекает пути к файлам и их FAISS chunk IDs для всех документов в базе данных.
+
+        Returns:
+            List[Dict[str, Any]]: Список словарей, каждый из которых содержит
+                                  'file_path' (str) и 'faiss_chunk_ids' (List[str]).
+        """
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT file_path, faiss_chunk_ids FROM documents")
+        rows = cursor.fetchall()
+        result = []
+        for row in rows:
+            result.append(
+                {
+                    "file_path": row[0],
+                    "faiss_chunk_ids": json.loads(row[1]) if row[1] else [],
+                }
+            )
+        return result
+
+    def delete_document_record(self, file_path: str):
+        """
+        Удаляет запись о документе из базы данных по его пути.
+
+        Args:
+            file_path (str): Путь к файлу документа, который нужно удалить.
+        """
+        cursor = self.conn.cursor()
+        cursor.execute("DELETE FROM documents WHERE file_path = ?", (file_path,))
+        self.conn.commit()
+        print(
+            f"Запись о документе '{os.path.basename(file_path)}' удалена из SQLite DB."
+        )
+
     def close(self):
         """Закрывает соединение с базой данных SQLite."""
         self.conn.close()
@@ -216,7 +224,9 @@ class DocumentStorage:
 
 class VectorDatabase:
     """
-    Управляет FAISS-векторными индексами для документов и кэша вопросов/ответов.
+    Класс для управления векторными базами данных FAISS.
+
+    Используется для основного индекса документов и для кэша вопросов/ответов.
     """
 
     def __init__(
@@ -316,7 +326,7 @@ class VectorDatabase:
     def get_cached_answer(
         self,
         question: str,
-        similarity_threshold: float = 0.1,
+        similarity_threshold: float = 0.1,  # Для L2 расстояния, чем меньше, тем лучше
     ) -> Optional[str]:
         """
         Пытается найти кэшированный ответ на вопрос, если существует достаточно похожий запрос.
@@ -378,9 +388,6 @@ class VectorDatabase:
         """
         Удаляет все записи из кэша, которые ссылаются на данный исходный файл.
         Использует базовое имя файла (например, "catalog.json" или "document.pdf").
-
-        Args:
-            source_file_name (str): Базовое имя файла-источника для инвалидации кэша.
         """
         if not self.cache_db:
             print(
@@ -389,18 +396,17 @@ class VectorDatabase:
             return
 
         if self.cache_db.index.ntotal == 0:
-            print("Кэш пуст, нечего удалять.")
+            # print("Кэш пуст, нечего удалять.") # Убрал, т.к. может быть много сообщений
             return
 
         ids_to_delete = []
-        for doc_id in list(
-            self.cache_db.docstore._dict.keys()
-        ):  # Iterate over docstore IDs
+        # Iterate over docstore IDs to get all documents
+        all_doc_ids_in_cache = list(self.cache_db.docstore._dict.keys())
+
+        for doc_id in all_doc_ids_in_cache:
             doc = self.cache_db.docstore.search(doc_id)
             if doc and doc.metadata.get("sources"):
-                # Проверяем, есть ли source_file_name в списке источников кэшированного ответа
-                # Источники в метаданных - это полные пути (или file_path#index),
-                # но мы их храним в add_to_cache как базовые имена, чтобы совпасть здесь.
+                # Check if source_file_name is in the list of sources for the cached answer
                 if source_file_name in doc.metadata["sources"]:
                     ids_to_delete.append(doc_id)
 
@@ -413,10 +419,8 @@ class VectorDatabase:
                 )
             except Exception as e:
                 print(f"Ошибка при удалении кэшированных записей: {e}")
-        else:
-            print(
-                f"Не найдено кэшированных записей, связанных с источником '{source_file_name}'."
-            )
+        # else: # Убрал, т.к. может быть много сообщений
+        #     print(f"Не найдено кэшированных записей, связанных с источником '{source_file_name}'.")
 
 
 def get_file_hash(file_path: str) -> str:
@@ -441,7 +445,7 @@ def get_file_hash(file_path: str) -> str:
 def update_document_in_faiss(
     doc_storage: DocumentStorage,
     vector_db: VectorDatabase,
-    file_path: str,
+    file_path: str,  # Это уникальный путь, например, "data/catalog.json#0"
     full_text_content: str,
     metadata: dict,
     current_file_hash: str,
@@ -452,19 +456,6 @@ def update_document_in_faiss(
     Обновляет документ в FAISS: удаляет старые чанки и добавляет новые.
     Сохраняет новые FAISS IDs в DocumentStorage.
     Возвращает список новых чанков.
-
-    Args:
-        doc_storage (DocumentStorage): Объект хранилища документов.
-        vector_db (VectorDatabase): Объект векторной базы данных.
-        file_path (str): Уникальный путь к документу (например, "data/catalog.json#0").
-        full_text_content (str): Полный текст документа.
-        metadata (dict): Метаданные документа.
-        current_file_hash (str): Хэш текущего содержимого файла.
-        current_last_modified (float): Время последнего изменения файла.
-        stored_doc_data (Optional[Dict[str, Any]]): Данные о документе из БД, если есть.
-
-    Returns:
-        List[Document]: Список новых чанков для индексации.
     """
     # Извлекаем базовое имя файла для инвалидации кэша
     base_file_name_for_cache_invalidation = os.path.basename(file_path.split("#")[0])
@@ -475,6 +466,7 @@ def update_document_in_faiss(
         print(f"Удалены старые FAISS чанки для {os.path.basename(file_path)}.")
 
     # **Инвалидация семантического кэша, связанного с этим источником**
+    # Вызываем только если есть реальное обновление контента
     print(
         f"Инвалидация кэша вопросов/ответов, связанных с '{base_file_name_for_cache_invalidation}'..."
     )
@@ -528,8 +520,18 @@ def process_catalog_json(
         with open(file_path, "r", encoding="utf-8") as f:
             catalog_data = json.load(f)
 
+        # Получаем текущие уникальные пути элементов JSON из БД для этого файла
+        # Чтобы определить, какие элементы были удалены ИЗНУТРИ JSON файла
+        indexed_item_paths_for_this_json = set()
+        for doc_info in doc_storage.get_all_document_paths_and_chunk_ids():
+            if doc_info["file_path"].startswith(file_path + "#"):
+                indexed_item_paths_for_this_json.add(doc_info["file_path"])
+
+        current_item_paths_in_json = set()
         for i, item in enumerate(catalog_data):
-            # Создаем текстовое представление для каждого элемента каталога
+            unique_item_path = f"{file_path}#{i}"
+            current_item_paths_in_json.add(unique_item_path)
+
             item_text_content = (
                 f"Название: {item.get('name', 'N/A')}\n"
                 f"Описание: {item.get('description', 'N/A')}\n"
@@ -538,18 +540,16 @@ def process_catalog_json(
                 f"URL: {item.get('url', 'N/A')}"
             )
 
-            # Создаем уникальный file_path для каждого элемента каталога
-            unique_item_path = f"{file_path}#{i}"
-
             # Метаданные для каждого элемента каталога
             metadata = {
-                "source": os.path.basename(file_path),
+                "source": os.path.basename(file_path),  # Base name of the JSON file
                 "item_name": item.get("name", "N/A"),
                 "item_url": item.get("url", "N/A"),
                 "index_in_catalog": i,
             }
 
             file_hash = hashlib.sha256(item_text_content.encode()).hexdigest()
+            # Используем время модификации самого JSON файла для определения необходимости переобработки
             last_modified = os.path.getmtime(file_path)
 
             stored_item = doc_storage.get_document(unique_item_path)
@@ -557,7 +557,8 @@ def process_catalog_json(
             if (
                 stored_item
                 and stored_item["file_hash"] == file_hash
-                and stored_item["last_modified"] >= last_modified
+                and stored_item["last_modified"]
+                >= last_modified  # Check if DB record is newer or same as file
             ):
                 # Если элемент не изменился, используем кэшированный текст и чанки
                 full_text_from_db = stored_item["content"]
@@ -565,9 +566,7 @@ def process_catalog_json(
                     [full_text_from_db], metadatas=[metadata]
                 )
                 documents_for_faiss.extend(chunks)
-                print(
-                    f"Используется кэшированный элемент каталога: {item.get('name', 'N/A')} из {os.path.basename(file_path)}"
-                )
+                # print(f"Используется кэшированный элемент каталога: {item.get('name', 'N/A')} из {os.path.basename(file_path)}")
             else:
                 # Элемент новый или изменился, обновляем его в FAISS и SQL DB
                 print(
@@ -584,6 +583,26 @@ def process_catalog_json(
                     stored_item,
                 )
                 documents_for_faiss.extend(new_chunks_for_faiss)
+
+        # Удаление элементов, которые были в DB, но теперь отсутствуют в JSON файле
+        for indexed_path in indexed_item_paths_for_this_json:
+            if indexed_path not in current_item_paths_in_json:
+                # Этот элемент был удален из JSON файла
+                print(f"Обнаружен удаленный элемент из JSON: '{indexed_path}'")
+                doc_info_to_delete = doc_storage.get_document(indexed_path)
+                if doc_info_to_delete:
+                    # Удаляем из FAISS
+                    if doc_info_to_delete["faiss_chunk_ids"]:
+                        vector_db.delete_documents(
+                            doc_info_to_delete["faiss_chunk_ids"]
+                        )
+
+                    # Инвалидируем кэш, связанный с базовым именем JSON файла
+                    base_json_file_name = os.path.basename(indexed_path.split("#")[0])
+                    vector_db.delete_cached_entries_by_source(base_json_file_name)
+
+                    # Удаляем запись из SQLite
+                    doc_storage.delete_document_record(indexed_path)
 
         return documents_for_faiss
 
@@ -608,6 +627,14 @@ def parse_files(
         List[Document]: Список объектов LangChain Document (сегментов), представляющих содержимое файлов для FAISS.
     """
     all_chunks = []
+
+    # Get a list of all file_paths in the data directory
+    # This is for identifying existing files, not their full paths as stored in DB for JSON elements.
+    existing_files_in_data_dir_full_path = {
+        os.path.join(directory, f)
+        for f in os.listdir(directory)
+        if os.path.isfile(os.path.join(directory, f))
+    }
 
     for filename in os.listdir(directory):
         file_path = os.path.join(directory, filename)
@@ -638,9 +665,7 @@ def parse_files(
                         [full_text_from_db], metadatas=[metadata]
                     )
                     all_chunks.extend(chunks)
-                    print(
-                        f"Используется кэшированный документ для: {filename}. Сегментов: {len(chunks)}"
-                    )
+                    # print(f"Используется кэшированный документ для: {filename}. Сегментов: {len(chunks)}")
                 else:
                     print(
                         f"Внимание: Кэшированный текст для {filename} пуст. Повторная обработка."
@@ -679,6 +704,62 @@ def parse_files(
     return all_chunks
 
 
+def cleanup_deleted_files(
+    doc_storage: DocumentStorage, vector_db: VectorDatabase, input_dir: str
+):
+    """
+    Проверяет документы в базе данных на соответствие файлам в input_dir.
+    Удаляет записи из FAISS и SQLite для файлов, которые больше не существуют.
+
+    Args:
+        doc_storage (DocumentStorage): Объект хранилища документов.
+        vector_db (VectorDatabase): Объект векторной базы данных.
+        input_dir (str): Директория, где должны находиться исходные файлы.
+    """
+    print("\n--- Проверка на удаленные файлы ---")
+    indexed_documents = doc_storage.get_all_document_paths_and_chunk_ids()
+
+    # Получаем список всех существующих базовых имен файлов в директории data
+    # (т.е. 'doc.pdf', 'catalog.json')
+    existing_base_filenames_in_data_dir = set()
+    for filename in os.listdir(input_dir):
+        if os.path.isfile(os.path.join(input_dir, filename)):
+            existing_base_filenames_in_data_dir.add(filename)
+
+    for doc_info in indexed_documents:
+        full_db_file_path = doc_info[
+            "file_path"
+        ]  # e.g., 'data/doc.pdf' or 'data/catalog.json#0'
+        faiss_chunk_ids = doc_info["faiss_chunk_ids"]
+
+        # Извлекаем фактическое имя файла на диске, на который ссылается запись в DB
+        # Для 'data/catalog.json#0' -> 'catalog.json'
+        # Для 'data/doc.pdf' -> 'doc.pdf'
+
+        # Получаем только имя файла без пути директории
+        file_name_from_db_record = os.path.basename(full_db_file_path)
+
+        # Если это JSON-элемент, отбрасываем '#индекс'
+        actual_file_on_disk_name = file_name_from_db_record.split("#")[0]
+
+        # Проверяем, существует ли соответствующий базовый файл в папке data
+        if actual_file_on_disk_name not in existing_base_filenames_in_data_dir:
+            print(
+                f"Обнаружен удаленный файл/элемент: '{full_db_file_path}' (связан с '{actual_file_on_disk_name}')"
+            )
+
+            # Удаляем из FAISS
+            if faiss_chunk_ids:
+                vector_db.delete_documents(faiss_chunk_ids)
+
+            # Удаляем записи из семантического кэша, связанные с этим файлом
+            vector_db.delete_cached_entries_by_source(actual_file_on_disk_name)
+
+            # Удаляем запись из SQLite DB
+            doc_storage.delete_document_record(full_db_file_path)
+    print("--- Проверка на удаленные файлы завершена ---")
+
+
 class RAGSystem:
     """
     Основной класс системы Retrieval Augmented Generation (RAG).
@@ -713,6 +794,9 @@ class RAGSystem:
         # Убедимся, что FAISS индекс инициализирован (загружен или создан пустым)
         self.vector_db.load_or_create()
         self.vector_db.load_or_create_cache()
+
+        # НОВОЕ: Проверка и очистка удаленных файлов
+        cleanup_deleted_files(self.doc_storage, self.vector_db, self.config.INPUT_DIR)
 
         # Парсинг файлов с возможностью точечного обновления
         documents = parse_files(self.config.INPUT_DIR, self.doc_storage, self.vector_db)
