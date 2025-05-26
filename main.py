@@ -1,16 +1,17 @@
+import argparse
 import hashlib
 import json
 import os
 import shutil
 import sqlite3
+import sys
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 import numpy as np
 from dotenv import load_dotenv
-from langchain.chains import LLMChain, RetrievalQA
+from langchain.chains import LLMChain
 from langchain.prompts import PromptTemplate
-from langchain.schema import HumanMessage
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
@@ -22,7 +23,9 @@ from unstructured.partition.auto import partition
 load_dotenv()
 api_key = os.getenv("OPENAI_API_KEY")
 if not api_key:
-    raise ValueError("OPENAI_API_KEY not found in .env file")
+    raise ValueError(
+        "OPENAI_API_KEY not found in .env file. Please create one and add your OPENAI_API_KEY."
+    )
 os.environ["OPENAI_API_KEY"] = api_key
 
 
@@ -58,23 +61,6 @@ class Config:
 
 # Инициализация объекта конфигурации
 config = Config()
-
-# --- ВРЕМЕННЫЙ КОД ДЛЯ ОЧИСТКИ ИНДЕКСОВ И БД ---
-# УДАЛИТЕ ЭТИ СТРОКИ ПОСЛЕ ПЕРВОГО УСПЕШНОГО ЗАПУСКА,
-# ЧТОБЫ КЭШИРОВАНИЕ ДОКУМЕНТОВ И РАБОТА С FAISS РАБОТАЛИ КОРРЕКТНО БЕЗ ПЕРЕИНДЕКСАЦИИ КАЖДЫЙ РАЗ!
-# print("Выполняется ОЧИСТКА старых индексов и базы данных...")
-# if os.path.exists(config.FAISS_INDEX_PATH):
-#     shutil.rmtree(config.FAISS_INDEX_PATH)
-#     print(f"Удалена папка FAISS индекса: {config.FAISS_INDEX_PATH}")
-# if os.path.exists(config.CACHE_INDEX_PATH):
-#     shutil.rmtree(config.CACHE_INDEX_PATH)
-#     print(f"Удалена папка кэша FAISS: {config.CACHE_INDEX_PATH}")
-# if os.path.exists(config.SQL_DB_PATH):
-#     os.remove(config.SQL_DB_PATH)
-#     print(f"Удалена база данных SQLite: {config.SQL_DB_PATH}")
-# print("Очистка завершена.")
-# --- КОНЕЦ ВРЕМЕННОГО КОДА ---
-
 
 # Создание директории для входных документов, если она не существует
 os.makedirs(config.INPUT_DIR, exist_ok=True)
@@ -234,7 +220,17 @@ class VectorDatabase:
                 self.db = FAISS.from_documents(documents, self.embeddings)
                 self.db.save_local(self.index_path)
             else:
-                raise ValueError("No documents provided to create FAISS index")
+                # Если документов нет, создаем пустой индекс, чтобы избежать ошибок при инициализации ретривера
+                print(
+                    "Нет документов для создания FAISS индекса. Создается пустой индекс."
+                )
+                # Создаем временный "пустой" документ, чтобы инициализировать FAISS,
+                # затем удаляем его, чтобы индекс был фактически пустым.
+                dummy_doc = Document(page_content="initialization_dummy", metadata={})
+                self.db = FAISS.from_documents([dummy_doc], self.embeddings)
+                # Удаляем "пустой" документ
+                self.db.delete([self.db.index_to_docstore_id[0]])
+                self.db.save_local(self.index_path)
 
     def load_or_create_cache(self, force_recreate: bool = False):
         """
@@ -298,10 +294,8 @@ class VectorDatabase:
 
         query_embedding = self.embeddings.embed_query(question)
 
-        # --- НОВОЕ ДОБАВЛЕНИЕ: Преобразование в NumPy массив ---
         if isinstance(query_embedding, list):
             query_embedding = np.array(query_embedding, dtype=np.float32)
-        # --- КОНЕЦ НОВОГО ДОБАВЛЕНИЯ ---
 
         scores, indices = self.cache_db.index.search(query_embedding.reshape(1, -1), 1)
 
@@ -537,7 +531,8 @@ class RAGSystem:
         self.retriever: Any = None
         self.qa_chain: Any = None
         self.prompt: PromptTemplate = None
-        self.initialize()
+        # Инициализация происходит в run() или в конкретных функциях,
+        # чтобы иметь контроль над моментом загрузки/создания индексов.
 
     def initialize(self):
         """
@@ -548,7 +543,7 @@ class RAGSystem:
 
         if not documents:
             print(
-                "ВНИМАНИЕ: Не удалось обработать ни одного документа для индексации. RAG система не будет работать корректно без данных."
+                "ВНИМАНИЕ: Не удалось обработать ни одного документа для индексации. RAG система может работать неоптимально."
             )
 
         self.vector_db.load_or_create(documents)
@@ -573,7 +568,7 @@ class RAGSystem:
         """
         self.prompt = PromptTemplate(
             input_variables=["context", "input"],
-            template=prompt_template,  # <--- УБЕДИТЕСЬ, ЧТО ЗДЕСЬ ['context', 'input']
+            template=prompt_template,
         )
 
         if self.vector_db.db and self.vector_db.db.index.ntotal > 0:
@@ -585,16 +580,20 @@ class RAGSystem:
             from langchain.chains.combine_documents import create_stuff_documents_chain
 
             combine_docs_chain = create_stuff_documents_chain(self.llm, self.prompt)
-
             self.qa_chain = create_retrieval_chain(self.retriever, combine_docs_chain)
 
         else:
             print(
                 "ВНИМАНИЕ: Основной FAISS индекс пуст. Невозможно инициализировать RetrievalQA. Будет использоваться простая LLM-цепочка."
             )
-            # Для LLMChain тоже нужно изменить input_variables, если вы будете ее использовать
-            # Если промпт всегда ожидает 'input' и 'context', то и здесь нужно поправить
-            self.qa_chain = LLMChain(llm=self.llm, prompt=self.prompt)
+            # Для простой LLMChain, если контекст не используется, можно упростить промпт
+            # или передавать пустой контекст, как сделано в query()
+            self.qa_chain = LLMChain(
+                llm=self.llm,
+                prompt=PromptTemplate(
+                    input_variables=["input"], template="Вопрос: {input}\nОтвет:"
+                ),
+            )
             self.retriever = None
 
     def query(self, question: str, use_cache: bool = True) -> str:
@@ -608,40 +607,21 @@ class RAGSystem:
                 print("Ответ найден в кэше.")
                 return cached_answer
 
-        if self.retriever is None:
+        if self.retriever is None or self.vector_db.db.index.ntotal == 0:
             print("Используется простая LLM-цепочка (нет документов для ретривала).")
-            result = self.qa_chain.invoke({"query": question, "context": ""})
-            answer = result.get(
-                "text", result.get("answer", "Не удалось сгенерировать ответ.")
-            )
+            # Если ретривер не инициализирован или пуст, используем LLMChain напрямую
+            result = self.llm.invoke(f"Вопрос: {question}\nОтвет:")
+            answer = result.content
             print("Ответ сгенерирован LLM без использования документов.")
             if use_cache:
                 self.vector_db.add_to_cache(question, answer)
                 print("Ответ добавлен в кэш.")
             return answer
 
-        # При использовании create_retrieval_chain, вам не нужно
-        # вызывать self.retriever.get_relevant_documents(question) вручную.
-        # Цепочка create_retrieval_chain сама позаботится о ретривале
-        # и передаче документов.
-
-        # ИЗМЕНЕНИЕ ЗДЕСЬ: УДАЛЯЕМ МАНУАЛЬНЫЙ ВЫЗОВ РЕТРИВЕРА
-        # retrieved_docs = self.retriever.get_relevant_documents(question)
-        # if not retrieved_docs:
-        #     print("Внимание: Ретривер не нашел релевантных документов для запроса.")
-        #     answer = "Я не смог найти информацию по вашему запросу в доступных документах."
-        #     if use_cache:
-        #         self.vector_db.add_to_cache(question, answer)
-        #     return answer
-
-        # ИЗМЕНЕНИЕ ЗДЕСЬ: Вызов `invoke` для `create_retrieval_chain`
-        # ему нужен только основной запрос, он сам вызовет ретривер
+        # Использование create_retrieval_chain
         result = self.qa_chain.invoke({"input": question})
-
-        # `create_retrieval_chain` возвращает словарь, который обычно содержит 'answer' и 'context' (retrieved_documents)
         answer = result.get("answer", "Не удалось сгенерировать ответ.")
 
-        # Дополнительно, вы можете вывести найденные документы, если нужно для отладки
         if "context" in result:
             retrieved_docs = result["context"]
             print(f"Найдено {len(retrieved_docs)} релевантных документов.")
@@ -666,11 +646,60 @@ class RAGSystem:
         print("Соединение с базой данных документов закрыто.")
 
 
-if __name__ == "__main__":
-    # Убедитесь, что catalog.json находится в папке 'data'
-    # Например: data/catalog.json
+# --- Функции для консольного приложения ---
 
+
+def clean_data():
+    """Очищает существующие индексы FAISS и базу данных SQLite."""
+    print("\n--- Очистка данных ---")
+    print("Выполняется ОЧИСТКА старых индексов и базы данных...")
+    if os.path.exists(config.FAISS_INDEX_PATH):
+        shutil.rmtree(config.FAISS_INDEX_PATH)
+        print(f"Удалена папка FAISS индекса: {config.FAISS_INDEX_PATH}")
+    if os.path.exists(config.CACHE_INDEX_PATH):
+        shutil.rmtree(config.CACHE_INDEX_PATH)
+        print(f"Удалена папка кэша FAISS: {config.CACHE_INDEX_PATH}")
+    if os.path.exists(config.SQL_DB_PATH):
+        os.remove(config.SQL_DB_PATH)
+        print(f"Удалена база данных SQLite: {config.SQL_DB_PATH}")
+    print("Очистка завершена.")
+    input("\nНажмите Enter для продолжения...")
+
+
+def run_indexing():
+    """Запускает процесс индексации документов."""
+    print("\n--- Запуск индексации документов ---")
     rag_system = RAGSystem(config)
+    rag_system.initialize()
+    rag_system.close()
+    print("Индексация завершена.")
+    input("\nНажмите Enter для продолжения...")
+
+
+def run_interactive_chat():
+    """Запускает интерактивный режим чата."""
+    print("\n--- Интерактивный чат ---")
+    print("Запуск интерактивного чата. Для выхода введите 'выход' или 'exit'.")
+    rag_system = RAGSystem(config)
+    rag_system.initialize()  # Инициализируем систему перед чатом
+
+    while True:
+        question = input("\nВаш вопрос: ")
+        if question.lower() in ("выход", "exit"):
+            break
+        answer = rag_system.query(question)
+        print(f"Ответ: {answer}")
+
+    rag_system.close()
+    print("Интерактивный чат завершен.")
+    input("\nНажмите Enter для продолжения...")
+
+
+def run_test_questions():
+    """Запускает прогон с предопределенными тестовыми вопросами."""
+    print("\n--- Прогон тестовых вопросов ---")
+    rag_system = RAGSystem(config)
+    rag_system.initialize()  # Инициализируем систему перед тестами
 
     questions = [
         "Какие серьги подойдут для вечернего мероприятия?",
@@ -680,11 +709,56 @@ if __name__ == "__main__":
         "Как ухаживать за жемчугом?",
         "Опишите Серебряные серьги с аметистами.",
         "Что такое Печатка с ониксом?",
+        "Какие украшения есть для мужчин?",
+        "Есть ли у вас что-то с бриллиантами?",
     ]
 
-    for question in questions:
+    for i, question in enumerate(questions):
+        print(f"\n--- Тестовый вопрос {i+1}/{len(questions)} ---")
         answer = rag_system.query(question)
         print(f"Ответ: {answer}\n")
+        # Добавляем паузу, чтобы пользователь мог прочитать ответ
+        if i < len(questions) - 1:
+            input("Нажмите Enter, чтобы перейти к следующему вопросу...")
 
     rag_system.close()
-    print("\nRAG система завершила работу.")
+    print("Прогон тестовых вопросов завершен.")
+    input("\nНажмите Enter для продолжения...")
+
+
+def display_menu():
+    """Отображает главное меню приложения."""
+    print("\n" + "=" * 50)
+    print("          Система RAG для ювелирных украшений")
+    print("=" * 50)
+    print("1. Очистить данные (индексы FAISS и базу данных)")
+    print("2. Проиндексировать документы (из папки 'data')")
+    print("3. Запустить интерактивный чат")
+    print("4. Запустить тестовые вопросы")
+    print("0. Выйти")
+    print("=" * 50)
+
+
+def main():
+    """Главная функция консольного приложения."""
+    while True:
+        display_menu()
+        choice = input("Выберите опцию: ")
+
+        if choice == "1":
+            clean_data()
+        elif choice == "2":
+            run_indexing()
+        elif choice == "3":
+            run_interactive_chat()
+        elif choice == "4":
+            run_test_questions()
+        elif choice == "0":
+            print("Выход из приложения. До свидания!")
+            break
+        else:
+            print("Неверный ввод. Пожалуйста, выберите число от 0 до 4.")
+
+
+if __name__ == "__main__":
+    main()
