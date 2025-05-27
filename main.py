@@ -5,7 +5,7 @@ import os
 import shutil
 import sqlite3
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta  # Изменено: добавлено timedelta
 from typing import Any, Dict, List, Optional
 
 import numpy as np
@@ -57,6 +57,8 @@ class Config:
     """
     SUPPORTED_EXTENSIONS: tuple = (".pdf", ".docx", ".txt", ".json")  # Добавляем .json
     """Кортеж поддерживаемых расширений файлов для обработки."""
+    CACHE_TTL_DAYS: float = 30.0
+    """Срок жизни записей в семантическом кэше в днях. Записи старше будут удалены."""
 
 
 # Инициализация объекта конфигурации
@@ -121,7 +123,7 @@ class DocumentStorage:
         last_modified: float,
         content: str,
         metadata: dict,
-        faiss_chunk_ids: Optional[List[str]] = None,  # Новый аргумент
+        faiss_chunk_ids: Optional[List[str]] = None,
     ):
         """
         Добавляет или обновляет информацию о документе в базе данных.
@@ -291,7 +293,10 @@ class VectorDatabase:
             )
         else:
             print(f"Создание нового FAISS кэша в {self.cache_path}...")
-            dummy_doc = Document(page_content="dummy", metadata={"answer": "dummy"})
+            dummy_doc = Document(
+                page_content="dummy",
+                metadata={"answer": "dummy", "timestamp": datetime.now().isoformat()},
+            )
             self.cache_db = FAISS.from_documents([dummy_doc], self.embeddings)
             self.cache_db.delete([self.cache_db.index_to_docstore_id[0]])
             self.cache_db.save_local(self.cache_path)
@@ -301,6 +306,7 @@ class VectorDatabase:
     ):
         """
         Добавляет вопрос и соответствующий ответ в кэш FAISS.
+        При добавлении новой записи также запускает очистку просроченных записей.
 
         Args:
             question (str): Запрос пользователя.
@@ -315,13 +321,15 @@ class VectorDatabase:
             metadata={
                 "answer": answer,
                 "timestamp": datetime.now().isoformat(),
-                "sources": (
-                    sources if sources is not None else []
-                ),  # Добавляем источники
+                "sources": (sources if sources is not None else []),
             },
         )
         self.cache_db.add_documents([doc])
         self.cache_db.save_local(self.cache_path)
+
+        # НОВОЕ: Вызываем очистку кэша по TTL после добавления новой записи
+        # Используем Config.CACHE_TTL_DAYS, так как Config доступен глобально
+        self.cleanup_expired_cache_entries(Config.CACHE_TTL_DAYS)
 
     def get_cached_answer(
         self,
@@ -396,17 +404,14 @@ class VectorDatabase:
             return
 
         if self.cache_db.index.ntotal == 0:
-            # print("Кэш пуст, нечего удалять.") # Убрал, т.к. может быть много сообщений
             return
 
         ids_to_delete = []
-        # Iterate over docstore IDs to get all documents
         all_doc_ids_in_cache = list(self.cache_db.docstore._dict.keys())
 
         for doc_id in all_doc_ids_in_cache:
             doc = self.cache_db.docstore.search(doc_id)
             if doc and doc.metadata.get("sources"):
-                # Check if source_file_name is in the list of sources for the cached answer
                 if source_file_name in doc.metadata["sources"]:
                     ids_to_delete.append(doc_id)
 
@@ -419,8 +424,48 @@ class VectorDatabase:
                 )
             except Exception as e:
                 print(f"Ошибка при удалении кэшированных записей: {e}")
-        # else: # Убрал, т.к. может быть много сообщений
-        #     print(f"Не найдено кэшированных записей, связанных с источником '{source_file_name}'.")
+
+    def cleanup_expired_cache_entries(self, ttl_days: int):
+        """
+        Удаляет записи из семантического кэша, срок жизни которых истек (старше ttl_days).
+        """
+        if not self.cache_db or self.cache_db.index.ntotal == 0:
+            return
+
+        print(f"--- Очистка семантического кэша (записи старше {ttl_days} дней) ---")
+
+        current_time = datetime.now()
+        expiration_threshold = current_time - timedelta(days=ttl_days)
+
+        ids_to_delete = []
+        all_doc_ids_in_cache = list(self.cache_db.docstore._dict.keys())
+
+        for doc_id in all_doc_ids_in_cache:
+            doc = self.cache_db.docstore.search(doc_id)
+            if doc and doc.metadata.get("timestamp"):
+                try:
+                    cache_timestamp_str = doc.metadata["timestamp"]
+                    cache_datetime = datetime.fromisoformat(cache_timestamp_str)
+
+                    if cache_datetime < expiration_threshold:
+                        ids_to_delete.append(doc_id)
+                except ValueError as e:
+                    print(
+                        f"Предупреждение: Неверный формат timestamp в кэше для {doc_id}: {cache_timestamp_str}. Ошибка: {e}"
+                    )
+
+        if ids_to_delete:
+            try:
+                self.cache_db.delete(ids_to_delete)
+                self.cache_db.save_local(self.cache_path)
+                print(
+                    f"Удалено {len(ids_to_delete)} просроченных записей из семантического кэша."
+                )
+            except Exception as e:
+                print(f"Ошибка при удалении просроченных записей из кэша: {e}")
+        else:
+            print("Не найдено просроченных записей в семантическом кэше.")
+        print("--- Очистка кэша завершена ---")
 
 
 def get_file_hash(file_path: str) -> str:
@@ -431,7 +476,6 @@ def get_file_hash(file_path: str) -> str:
 
     Args:
         file_path (str): Путь к файлу.
-
     Returns:
         str: Шестнадцатеричное представление SHA256-хэша файла.
     """
@@ -511,7 +555,6 @@ def process_catalog_json(
         file_path (str): Путь к JSON-файлу каталога.
         doc_storage (DocumentStorage): Объект хранилища документов для сохранения метаданных.
         vector_db (VectorDatabase): Объект векторной базы данных для обновления FAISS.
-
     Returns:
         List[Document]: Список объектов LangChain Document (сегментов) для индексации.
     """
@@ -566,7 +609,6 @@ def process_catalog_json(
                     [full_text_from_db], metadatas=[metadata]
                 )
                 documents_for_faiss.extend(chunks)
-                # print(f"Используется кэшированный элемент каталога: {item.get('name', 'N/A')} из {os.path.basename(file_path)}")
             else:
                 # Элемент новый или изменился, обновляем его в FAISS и SQL DB
                 print(
@@ -622,14 +664,12 @@ def parse_files(
         directory (str): Путь к директории с файлами для обработки.
         doc_storage (DocumentStorage): Объект хранилища документов для сохранения метаданных.
         vector_db (VectorDatabase): Объект векторной базы данных для обновления FAISS.
-
     Returns:
         List[Document]: Список объектов LangChain Document (сегментов), представляющих содержимое файлов для FAISS.
     """
     all_chunks = []
 
     # Get a list of all file_paths in the data directory
-    # This is for identifying existing files, not their full paths as stored in DB for JSON elements.
     existing_files_in_data_dir_full_path = {
         os.path.join(directory, f)
         for f in os.listdir(directory)
@@ -665,7 +705,6 @@ def parse_files(
                         [full_text_from_db], metadatas=[metadata]
                     )
                     all_chunks.extend(chunks)
-                    # print(f"Используется кэшированный документ для: {filename}. Сегментов: {len(chunks)}")
                 else:
                     print(
                         f"Внимание: Кэшированный текст для {filename} пуст. Повторная обработка."
@@ -720,26 +759,17 @@ def cleanup_deleted_files(
     indexed_documents = doc_storage.get_all_document_paths_and_chunk_ids()
 
     # Получаем список всех существующих базовых имен файлов в директории data
-    # (т.е. 'doc.pdf', 'catalog.json')
     existing_base_filenames_in_data_dir = set()
     for filename in os.listdir(input_dir):
         if os.path.isfile(os.path.join(input_dir, filename)):
             existing_base_filenames_in_data_dir.add(filename)
 
     for doc_info in indexed_documents:
-        full_db_file_path = doc_info[
-            "file_path"
-        ]  # e.g., 'data/doc.pdf' or 'data/catalog.json#0'
+        full_db_file_path = doc_info["file_path"]
         faiss_chunk_ids = doc_info["faiss_chunk_ids"]
 
-        # Извлекаем фактическое имя файла на диске, на который ссылается запись в DB
-        # Для 'data/catalog.json#0' -> 'catalog.json'
-        # Для 'data/doc.pdf' -> 'doc.pdf'
-
-        # Получаем только имя файла без пути директории
         file_name_from_db_record = os.path.basename(full_db_file_path)
 
-        # Если это JSON-элемент, отбрасываем '#индекс'
         actual_file_on_disk_name = file_name_from_db_record.split("#")[0]
 
         # Проверяем, существует ли соответствующий базовый файл в папке data
@@ -783,22 +813,22 @@ class RAGSystem:
         self.retriever: Any = None
         self.qa_chain: Any = None
         self.prompt: PromptTemplate = None
-        # Инициализация происходит в run() или в конкретных функциях,
-        # чтобы иметь контроль над моментом загрузки/создания индексов.
 
     def initialize(self):
         """
         Инициализирует компоненты системы: загружает/обрабатывает документы и настраивает цепочки LangChain.
         """
         print("Инициализация RAG системы...")
-        # Убедимся, что FAISS индекс инициализирован (загружен или создан пустым)
         self.vector_db.load_or_create()
         self.vector_db.load_or_create_cache()
 
-        # НОВОЕ: Проверка и очистка удаленных файлов
+        # Проверка и очистка удаленных файлов
         cleanup_deleted_files(self.doc_storage, self.vector_db, self.config.INPUT_DIR)
 
-        # Парсинг файлов с возможностью точечного обновления
+        # НЕТ НЕОБХОДИМОСТИ ВЫЗЫВАТЬ ЗДЕСЬ cleanup_expired_cache_entries,
+        # так как она будет вызвана при каждом добавлении в кэш.
+        # self.vector_db.cleanup_expired_cache_entries(self.config.CACHE_TTL_DAYS)
+
         documents = parse_files(self.config.INPUT_DIR, self.doc_storage, self.vector_db)
 
         if not documents and self.vector_db.db.index.ntotal == 0:
@@ -871,12 +901,11 @@ class RAGSystem:
             answer = result.content
             print("Ответ сгенерирован LLM без использования документов.")
             if use_cache:
-                # В этом случае источников нет, т.к. LLM ответила без ретривала
+                # add_to_cache теперь сама вызывает cleanup_expired_cache_entries
                 self.vector_db.add_to_cache(question, answer, sources=[])
                 print("Ответ добавлен в кэш.")
             return answer
 
-        # Использование create_retrieval_chain
         result = self.qa_chain.invoke({"input": question})
         answer = result.get("answer", "Не удалось сгенерировать ответ.")
 
@@ -886,14 +915,11 @@ class RAGSystem:
             print(f"Найдено {len(retrieved_docs)} релевантных документов.")
             for i, doc in enumerate(retrieved_docs):
                 source = doc.metadata.get("source", "N/A")
-                # Для JSON-файлов мы используем уникальный путь: data/catalog.json#0
-                # Нужно извлечь только базовое имя файла для кэша: catalog.json
-                if "#" in source:  # Это элемент из JSON-каталога
+                if "#" in source:
                     base_source = os.path.basename(source.split("#")[0])
-                else:  # Это обычный файл
+                else:
                     base_source = os.path.basename(source)
 
-                # Добавляем только уникальные базовые имена источников
                 if base_source not in retrieved_sources:
                     retrieved_sources.append(base_source)
 
@@ -906,7 +932,7 @@ class RAGSystem:
         print("Ответ сгенерирован LLM с использованием документов.")
 
         if use_cache:
-            # Передаем список использованных базовых имен источников в кэш
+            # add_to_cache теперь сама вызывает cleanup_expired_cache_entries
             self.vector_db.add_to_cache(question, answer, sources=retrieved_sources)
             print("Ответ добавлен в кэш.")
 
@@ -938,6 +964,20 @@ def clean_data():
     input("\nНажмите Enter для продолжения...")
 
 
+def clear_semantic_cache():
+    """Полностью очищает семантический кэш, удаляя его папку."""
+    print("\n--- Очистка семантического кэша ---")
+    if os.path.exists(config.CACHE_INDEX_PATH):
+        shutil.rmtree(config.CACHE_INDEX_PATH)
+        print(f"Удалена папка семантического кэша: {config.CACHE_INDEX_PATH}")
+        print(
+            "Семантический кэш полностью очищен. Он будет пересоздан при следующем использовании."
+        )
+    else:
+        print("Папка семантического кэша не найдена. Кэш уже пуст или не существует.")
+    input("\nНажмите Enter для продолжения...")
+
+
 def run_indexing():
     """Запускает процесс индексации документов."""
     print("\n--- Запуск индексации документов ---")
@@ -953,7 +993,7 @@ def run_interactive_chat():
     print("\n--- Интерактивный чат ---")
     print("Запуск интерактивного чата. Для выхода введите 'выход' или 'exit'.")
     rag_system = RAGSystem(config)
-    rag_system.initialize()  # Инициализируем систему перед чатом
+    rag_system.initialize()
 
     while True:
         question = input("\nВаш вопрос: ")
@@ -971,7 +1011,7 @@ def run_test_questions():
     """Запускает прогон с предопределенными тестовыми вопросами."""
     print("\n--- Прогон тестовых вопросов ---")
     rag_system = RAGSystem(config)
-    rag_system.initialize()  # Инициализируем систему перед тестами
+    rag_system.initialize()
 
     questions = [
         "Какие серьги подойдут для вечернего мероприятия?",
@@ -989,7 +1029,6 @@ def run_test_questions():
         print(f"\n--- Тестовый вопрос {i+1}/{len(questions)} ---")
         answer = rag_system.query(question)
         print(f"Ответ: {answer}\n")
-        # Добавляем паузу, чтобы пользователь мог прочитать ответ
         if i < len(questions) - 1:
             input("Нажмите Enter, чтобы перейти к следующему вопросу...")
 
@@ -1007,6 +1046,7 @@ def display_menu():
     print("2. Проиндексировать документы (из папки 'data')")
     print("3. Запустить интерактивный чат")
     print("4. Запустить тестовые вопросы")
+    print("5. Очистить семантический кэш (полностью)")
     print("0. Выйти")
     print("=" * 50)
 
@@ -1025,11 +1065,13 @@ def main():
             run_interactive_chat()
         elif choice == "4":
             run_test_questions()
+        elif choice == "5":
+            clear_semantic_cache()
         elif choice == "0":
             print("Выход из приложения. До свидания!")
             break
         else:
-            print("Неверный ввод. Пожалуйста, выберите число от 0 до 4.")
+            print("Неверный ввод. Пожалуйста, выберите число от 0 до 5.")
 
 
 if __name__ == "__main__":
